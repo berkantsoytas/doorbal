@@ -1,50 +1,56 @@
 from pathlib import Path
+import shutil
+import subprocess
 
 import cv2
 
 
-def _detect_camera_priority(device_path: Path):
-    sysfs_device_dir = Path("/sys/class/video4linux") / device_path.name / "device"
+def _is_capture_device(source) -> bool | None:
+    if not isinstance(source, str) or not source.startswith("/dev/video"):
+        return None
+    if shutil.which("v4l2-ctl") is None:
+        return None
 
-    resolved_parts = []
-    if sysfs_device_dir.exists():
-        try:
-            resolved_parts = [part.lower() for part in sysfs_device_dir.resolve().parts]
-        except OSError:
-            resolved_parts = []
+    try:
+        result = subprocess.run(
+            ["v4l2-ctl", "-d", source, "--all"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
 
-    device_text = " ".join(resolved_parts)
-    if "usb" in device_text:
-        return 0
-    if any(keyword in device_text for keyword in ["bcm2835", "csi", "unicam", "rp1-cfe"]):
-        return 2
-    return 1
+    if result.returncode != 0:
+        return False
+
+    details = (result.stdout + result.stderr).lower()
+    if "video capture" in details or "video capture mplane" in details:
+        return True
+    return False
 
 
-def _candidate_camera_indices(max_index: int = 10):
+def _candidate_camera_sources(max_index: int = 10):
     linux_devices = sorted(Path("/dev").glob("video*"))
-    seen_indices = set()
+    seen_sources = set()
 
-    prioritized_devices = sorted(
-        linux_devices,
-        key=lambda device: (_detect_camera_priority(device), device.name),
-    )
-
-    for device_path in prioritized_devices:
-        suffix = device_path.name.replace("video", "")
-        if suffix.isdigit():
-            camera_index = int(suffix)
-            if camera_index not in seen_indices:
-                seen_indices.add(camera_index)
-                yield camera_index
+    for device_path in linux_devices:
+        device_str = str(device_path)
+        capture_device = _is_capture_device(device_str)
+        if capture_device is False:
+            continue
+        if device_str not in seen_sources:
+            seen_sources.add(device_str)
+            yield device_str
 
     for camera_index in range(max_index):
-        if camera_index not in seen_indices:
+        if camera_index not in seen_sources:
             yield camera_index
 
 
-def _open_and_validate(index: int, backend):
-    camera = cv2.VideoCapture(index, backend) if backend is not None else cv2.VideoCapture(index)
+def _open_and_validate(source, backend):
+    camera = cv2.VideoCapture(source, backend) if backend is not None else cv2.VideoCapture(source)
     if not camera.isOpened():
         camera.release()
         return None
@@ -60,14 +66,14 @@ def _open_and_validate(index: int, backend):
 def open_camera():
     backends = [cv2.CAP_V4L2, None]
 
-    for camera_index in _candidate_camera_indices():
+    for camera_source in _candidate_camera_sources():
         for backend in backends:
-            camera = _open_and_validate(camera_index, backend)
+            camera = _open_and_validate(camera_source, backend)
             if camera is not None:
                 backend_name = "V4L2" if backend == cv2.CAP_V4L2 else "default"
-                print(f"Kamera bulundu: /dev/video{camera_index} ({backend_name})")
+                print(f"Kamera bulundu: {camera_source} ({backend_name})")
                 return camera
 
     raise RuntimeError(
-        "Kamera acilamadi. Raspberry Pi uzerinde USB webcam baglantisini, /dev/video* cihazlarini ve kullanici izinlerini kontrol et."
+        "Kamera acilamadi. /dev/video* cihazlarini, kamera baglantisini ve kullanici izinlerini kontrol et."
     )
